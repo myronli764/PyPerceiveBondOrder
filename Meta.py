@@ -149,19 +149,64 @@ maxb = {
     18: 0   # Argon (Ar)
 }
 
+en_map = {
+    "H": 2.300, "He": 4.160,
+    "Li": 0.912, "Be": 1.576,
+    "B": 2.051, "C": 2.544,
+    "N": 3.066, "O": 3.610,
+    "F": 4.193, "Ne": 4.787,
+    "Na": 0.869, "Mg": 1.293,
+    "Al": 1.613, "Si": 1.916,
+    "P": 2.253, "S": 2.589,
+    "Cl": 2.869, "Ar": 3.242,
+    "K": 0.734, "Ca": 1.034,
+    "Sc": 1.19, "Ti": 1.38,
+    "V": 1.53, "Cr": 1.65,
+    "Mn": 1.75, "Fe": 1.80,
+    "Co": 1.84, "Ni": 1.88,
+    "Cu": 1.85, "Zn": 1.588,
+    "Ga": 1.756, "Ge": 1.994,
+    "As": 2.211, "Se": 2.424,
+    "Br": 2.685, "Kr": 2.966,
+    "Rb": 0.706, "Sr": 0.963,
+    "Y": 1.12, "Zr": 1.32,
+    "Nb": 1.41, "Mo": 1.47,
+    "Tc": 1.51, "Ru": 1.54,
+    "Rh": 1.56, "Pd": 1.58,
+    "Ag": 1.87, "Cd": 1.521,
+    "In": 1.656, "Sn": 1.824,
+    "Sb": 1.984, "Te": 2.158,
+    "I": 2.359, "Xe": 2.582,
+    "Cs": 0.659, "Ba": 0.881,
+    "Lu": 1.09, "Hf": 1.16,
+    "Ta": 1.34, "W": 1.47,
+    "Re": 1.60, "Os": 1.65,
+    "Ir": 1.68, "Pt": 1.72,
+    "Au": 1.92, "Hg": 1.765,
+    "Tl": 1.789, "Pb": 1.854,
+    "Bi": 2.01, "Po": 2.19,
+    "At": 2.39, "Rn": 2.60,
+    "Fr": 0.67, "Ra": 0.89
+}
+
+
 class Atom:
     """
     Minimal Atom interface assumed by connect_the_dots().
     """
     def __init__(self, idx: int, coord: Tuple[float, float, float],
-                 atomic_num: int, element: str,
-                 formal_charge: int = 0, explicit_bonds = List['Bond']):
+                 atomic_num: int, element: str, hybridization: int = 0,
+                 formal_charge: int = 0, explicit_bonds = List['Bond'],
+                 is_aromatic: bool = False):
         self.idx = idx                  # 1-based
         self.coord = coord              # (x, y, z)
         self.atomic_num = atomic_num
         self.element = element          # e.g. "C"
         self.formal_charge = formal_charge
         self.bonds = explicit_bonds   # explicit bonds
+        self.hybridization = hybridization
+        self.is_aromatic = is_aromatic
+        self.en = en_map[element] if element in en_map else 1.0
 
     def explicit_degree(self) -> int:
         return len(self.bonds)
@@ -249,6 +294,8 @@ class Atom:
     def set_formal_charge(self, charge: int) -> None:
         self.formal_charge = charge
 
+    def set_aromatic(self, aromatic: bool) -> None:
+        self.is_aromatic = aromatic
 
 class Bond:
     """
@@ -267,6 +314,9 @@ class Bond:
 
     def set_order(self, o: int) -> None:
         self.order = o
+
+    def length(self) -> float:
+        return math.sqrt(self.length_sq())
 
 class UnitCell:
     """
@@ -314,6 +364,15 @@ class TCMol:
         self.box = box
         self.graphs = graphs
         self.bonds: List['Bond'] = []
+        self.bonds_hash = {}
+        for i,j in self.graphs.edges():
+            a1 = self.get_atom_with_idx(i)
+            a2 = self.get_atom_with_idx(j)
+            bond = Bond(a1, a2)
+            self.bonds.append(bond)
+            self.bonds_hash[(i, j)] = bond
+            #self.bonds_hash[(i, j)] = bond
+        self._sssr = None  # cached SSSR rings
 
     def get_atom_with_idx(self, idx: int) -> Atom:
         #for atom in self.atoms:
@@ -410,11 +469,14 @@ class TCMol:
                     break
                 atom.delete_bond(to_delete)
                 self.graphs.remove_edge(to_delete.a1.idx, to_delete.a2.idx)
+
         for i,j in self.graphs.edges():
             a1 = self.get_atom_with_idx(i)
             a2 = self.get_atom_with_idx(j)
             bond = Bond(a1, a2)
             self.bonds.append(bond)
+            if (i, j) not in self.bonds_hash and (j, i) not in self.bonds_hash:
+                self.bonds_hash[(i, j)] = bond
 
     def HasBond(self, a1: Atom, a2: Atom) -> bool:
         if a1.is_connected(a2):
@@ -422,9 +484,14 @@ class TCMol:
         return False
 
     def get_bond(self, i: int, j: int) -> Bond:
-        a1 = self.get_atom_with_idx(i)
-        a2 = self.get_atom_with_idx(j)
-        return Bond(a1, a2)
+        #a1 = self.get_atom_with_idx(i)
+        #a2 = self.get_atom_with_idx(j)
+        if (i, j) in self.bonds_hash:
+            return self.bonds_hash[(i, j)]
+        elif (j, i) in self.bonds_hash:
+            return self.bonds_hash[(j, i)]
+        else:
+            raise ValueError(f'No bond between {i} and {j}')
 
     def get_sssr(self) -> List[List[int]]:
         """
@@ -432,7 +499,7 @@ class TCMol:
         Stub: return cached or empty.
         """
         if self._sssr is None:
-            self._sssr = []  # real code would call ring finder
+            self._sssr = nx.cycle_basis(self.graphs)
         return self._sssr
 
     def _average_ring_torsion(self, path: List[int]) -> float:
@@ -440,20 +507,55 @@ class TCMol:
         Average absolute torsion over a ring path.
         Stub: return 0.0 to force sp2.
         """
-        return 0.0
+        #print(path)
+        edges = []
+        for i in path:
+            for j in path:
+                if i == j:
+                    continue
+                if (i, j) in edges or (j, i) in edges:
+                    continue
+                if self.HasBond(self.get_atom_with_idx(i), self.get_atom_with_idx(j)):
+                    edges.append((i, j))
+        torsions = []
+        for i, j in edges:
+            ai = self.get_atom_with_idx(i)
+            aj = self.get_atom_with_idx(j)
+            for ak in ai.neighbors():
+                if ak.idx in path and ak.idx != j:
+                    for al in aj.neighbors():
+                        if al.idx in path and al.idx != i and al.idx != ak.idx:
+                            # compute torsion angle ak-ai-aj-al
+                            p1 = np.array(ak.coord)
+                            p2 = np.array(ai.coord)
+                            p3 = np.array(aj.coord)
+                            p4 = np.array(al.coord)
+                            b1 = p2 - p1
+                            b2 = p3 - p2
+                            b3 = p4 - p3
+                            b2 /= np.linalg.norm(b2)
+                            v = b1 - np.dot(b1, b2) * b2
+                            w = b3 - np.dot(b3, b2) * b2
+                            x = np.dot(v, -w)
+                            #print(v, w)
+                            cos_angle = x / (np.linalg.norm(v) * np.linalg.norm(w))
+                            #print(cos_angle)
+                            angle = np.arccos(round(cos_angle,5))/np.pi*180.0
+                            #y = np.dot(np.cross(b2, v), w)
+                            #angle = math.degrees(math.atan2(y, x))
+
+                            torsions.append(abs(angle))
+        #print(torsions)
+        if torsions:
+            return sum(torsions) / len(torsions)
+        else:
+            return 0.0
 
     def _is_double_geometry(self, a1: Atom, a2: Atom) -> bool:
         """
         Stub for GetBond(a1,a2)->IsDoubleBondGeometry()
         """
         return True
-
-    def _kekulize(self) -> None:
-        """
-        Stub for OBKekulize; would assign final single/double alternation.
-        """
-        pass
-
 
     def TCMolToMol(self) -> Chem.RWMol:
         mol = Chem.RWMol()
@@ -476,7 +578,7 @@ class TCMol:
 
 
 if __name__ == '__main__':
-    mol = Chem.MolFromSmiles('c1ccccc1')
+    mol = Chem.MolFromSmiles('CC(C)(c1ccc(Oc2ccc3c(c2)C(=O)OC3=O)cc1)c1ccc(Oc2ccc3c(c2)C(=O)OC3=O)cc1')
     mol = Chem.AddHs(mol)
     AllChem.EmbedMolecule(mol)
     AllChem.MMFFOptimizeMolecule(mol)
@@ -484,6 +586,10 @@ if __name__ == '__main__':
     for atom in mol.GetAtoms():
         idx = atom.GetIdx()
         graphs.add_node(idx, element=atom.GetSymbol(), position=mol.GetConformer().GetAtomPosition(idx))
+    #for bond in mol.GetBonds():
+    #    a1 = bond.GetBeginAtomIdx()
+    #    a2 = bond.GetEndAtomIdx()
+    #    graphs.add_edge(a1, a2)
     tCMol = TCMol(graphs)
     tCMol.connect_the_dots()
     new_mol = tCMol.TCMolToMol()
@@ -491,7 +597,8 @@ if __name__ == '__main__':
     from BondTyper import BondTyper
 
     bondtyper = BondTyper('bondtyp.txt')
-    bondtyper.assign_functional_group_bonds(new_mol)
+    #bondtyper.assign_functional_group_bonds(new_mol,tCMol)
+    bondtyper.perceive_bond_order(new_mol, tCMol)
     for bond, bond_, bond2 in zip(tCMol.bonds, mol.GetBonds(), new_mol.GetBonds()):
         ai, aj = bond_.GetBeginAtomIdx(), bond_.GetEndAtomIdx()
         if not tCMol.HasBond(tCMol.get_atom_with_idx(ai), tCMol.get_atom_with_idx(aj)):
@@ -505,3 +612,5 @@ if __name__ == '__main__':
         print('TCMol2RWMol', ai, aj,
               f'{bond2.GetBondTypeAsDouble():>2.2f} {bond2.GetBeginAtom().GetSymbol()}-{bond2.GetEndAtom().GetSymbol()}')
         print('--------------------')
+        if bond_.GetBondTypeAsDouble() != bond2.GetBondTypeAsDouble():
+            raise ValueError(f'Bond order mismatch: {ai}-{aj} {bond_.GetBondTypeAsDouble()} != {bond2.GetBondTypeAsDouble()}')

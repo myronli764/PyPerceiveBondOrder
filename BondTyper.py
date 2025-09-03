@@ -7,13 +7,14 @@ information, driven by SMARTS patterns and optional geometric tests.
 
 import os
 import logging
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
-from Meta import Atom, TCMol
+from Meta import Atom, TCMol, Bond
 import networkx as nx
+import math
 
 bondtyp_txt = """##############################################################################
 #                                                                            #
@@ -222,6 +223,7 @@ class BondTyper:
         pos = mol.GetConformer().GetPositions()
         nbrs = a1.GetNeighbors()
         x0 = pos[a1.GetIdx()]
+        av_angs = 0
         angs = []
         for nbr_i in nbrs:
             for nbr_j in nbrs:
@@ -229,9 +231,13 @@ class BondTyper:
                     continue
                 xi = pos[nbr_i.GetIdx()]
                 xj = pos[nbr_j.GetIdx()]
+                xi = xi - x0
+                xj = xj - x0
                 ang = xi.dot(xj)/np.linalg.norm(xi)/np.linalg.norm(xj)
                 angs.append(ang)
-        return float(np.mean(angs))
+        if len(angs) != 0:
+            av_angs = float(np.arccos(np.mean(angs)))/np.pi*180
+        return av_angs#float(np.mean(angs))
 
     def d2_distance(self,mol, a1, a2) -> float:
         pos = mol.GetConformer().GetPositions()
@@ -273,7 +279,15 @@ class BondTyper:
             return
         self._fgbonds.append((patt, ints))
 
-    def assign_functional_group_bonds(self, mol: Union[Chem.RWMol, Chem.Mol]) -> None:
+    def _sanitize(self,mol: Union[Chem.RWMol, Chem.Mol], tcmol: TCMol) -> None:
+        Chem.SanitizeMol(mol)
+        for atom in mol.GetAtoms():
+            a_tc = tcmol.get_atom_with_idx(atom.GetIdx())
+            if a_tc:
+                a_tc.set_aromatic(atom.GetIsAromatic())
+
+
+    def assign_functional_group_bonds(self, mol: Union[Chem.RWMol, Chem.Mol], tcmol: TCMol) -> None:
         """
         For each SMARTS rule and each match, set bond orders on `mol`.
         Also apply special rules for carbonyls, thiones, etc., with geometry.
@@ -298,11 +312,15 @@ class BondTyper:
                         i1, i2, order = assigns[k:k+3]
                         a1 = mol.GetAtomWithIdx(umap[i1])
                         a2 = mol.GetAtomWithIdx(umap[i2])
+                        a1_tcmol = tcmol.get_atom_with_idx(umap[i1])
+                        a2_tcmol = tcmol.get_atom_with_idx(umap[i2])
                         if not a1 or not a2:
                             continue
                         b = mol.GetBondBetweenAtoms(a1.GetIdx(), a2.GetIdx())
+                        b_tc = tcmol.get_bond(umap[i1], umap[i2])
                         if b:
                             b.SetBondType(o2t[order])
+                            b_tc.set_order(order)
 
         # 2) Hard‐coded geometric rules
         def apply_rule(smarts, idx_i, idx_j, min_angle, max_angle, max_dist, set_order=None, set_charge=None):
@@ -312,19 +330,26 @@ class BondTyper:
             for umap in patt.get_umap_list():
                 a1 = mol.get_atom(umap[idx_i])
                 a2 = mol.get_atom(umap[idx_j])
+                a1_tcmol = tcmol.get_atom_with_idx(umap[idx_i])
+                a2_tcmol = tcmol.get_atom_with_idx(umap[idx_j])
                 if not a1 or not a2:
                     continue
                 angle = self.average_angle(mol,a2)
                 dist = self.d2_distance(mol,a1,a2)
                 if min_angle < angle < max_angle and dist < max_dist:
                     b = mol.GetBondBetweenAtoms(a1.GetIdx(),a2.GetIdx())
+                    b_tc = tcmol.get_bond(umap[idx_i], umap[idx_j])
                     if set_order and b:
                         if set_order == 2 and self.has_double_bond(a1):
                             continue
                         b.SetBondType(o2t[set_order])
+                        b_tc.set_order(set_order)
                     if set_charge:
                         a1.set_formal_charge(set_charge[0])
                         a2.set_formal_charge(set_charge[1])
+                        a1_tcmol.set_formal_charge(set_charge[0])
+                        a2_tcmol.set_formal_charge(set_charge[1])
+
 
         # carbonyl C=O
         apply_rule("[#8D1;!-][#6](*)(*)", idx_i=0, idx_j=1,
@@ -348,6 +373,9 @@ class BondTyper:
                 a1 = mol.GetAtomWithIdx(umap[0])
                 a2 = mol.GetAtomWithIdx(umap[1])
                 a3 = mol.GetAtomWithIdx(umap[2])
+                a1_tcmol = tcmol.get_atom_with_idx(umap[0])
+                a2_tcmol = tcmol.get_atom_with_idx(umap[1])
+                a3_tcmol = tcmol.get_atom_with_idx(umap[2])
                 if not (a1 and a2 and a3):
                     continue
                 angle = self.average_angle(mol,a2)#a2.average_bond_angle()
@@ -360,28 +388,206 @@ class BondTyper:
                 if angle > 150 and ok12 and d23 < 1.34:
                     b12 = mol.GetBondBetweenAtoms(a2.GetIdx(),a1.GetIdx())#a1.get_bond(a2)
                     b23 = mol.GetBondBetweenAtoms(a2.GetIdx(),a3.GetIdx())#a2.get_bond(a3)
+                    b12_tc = tcmol.get_bond(umap[1], umap[0])
+                    b23_tc = tcmol.get_bond(umap[1], umap[2])
                     if b12:
                         b12.SetBondType(o2t[2])
+                        b12_tc.set_order(2)
                     if b23:
                         b23.SetBondType(o2t[2])
+                        b23_tc.set_order(2)
 
-    def perceive_bond_order(self, mol: Union[Chem.RWMol, Chem.Mol]) -> None:
+    def perceive_bond_order(self, mol: Union[Chem.RWMol, Chem.Mol], tcmol: TCMol) -> None:
         """
-        Main entry point. Assign bond orders on `mol`.
-        `mol` must implement:
-            - get_atom(idx) -> Atom or None
-            - Atom.get_bond(other) -> Bond or None
-            - Bond.set_order(n)
-            - Atom.distance_to(other) -> float
-            - Atom.average_bond_angle() -> float
-            - Atom.has_double_bond() -> bool
-            - Atom.set_formal_charge(int)
-            - Atom.atomic_num
+        Main driver for bond‐order perception.
         """
-        self.assign_functional_group_bonds(mol)
+        if not tcmol.atoms:
+            return
+
+        # Pass 1: Hybridization from average angles
+        for atom in tcmol.atoms:
+            rdatom = mol.GetAtomWithIdx(atom.idx)
+            ang = self.average_angle(mol, rdatom)
+            #print(atom.element, atom.hybridization)
+            if ang > 155.0:
+                atom.set_hybridization(1)
+            elif ang > 115.0:
+                atom.set_hybridization(2)
+            #else:
+            #    atom.set_hybridization(3)
+            # special imine/azete cases
+            if (atom.atomic_num == 7
+               and atom.explicit_hydrogen_count() == 1
+               and atom.explicit_degree() == 2
+               and ang > 109.5):
+                atom.set_hybridization(2)
+            elif (atom.atomic_num == 7
+                  and atom.explicit_degree() == 2
+                  and atom.is_in_ring()):
+                atom.set_hybridization(2)
+            #print(atom.element, atom.hybridization)
+
+
+        # Pass 2: Ring torsion → sp2 in small planar rings
+        rings = tcmol.get_sssr()
+        for path in rings:
+            size = len(path)
+            tors = tcmol._average_ring_torsion(path)
+            #print(f'Ring size {size}, torsion {tors:.1f}')
+            if (size == 5 and tors <= 7.5) or (size == 6 and tors <= 12.0):
+                for idx in path:
+                    atom = tcmol.get_atom_with_idx(idx)
+                    deg = atom.explicit_degree()
+                    if (size == 5 and deg == 2) or (size == 6 and deg in (2,3)):
+                        atom.set_hybridization(2)
+
+        # Pass 3: Antialiasing
+        for atom in tcmol.atoms:
+            h = atom.hybridization or 3
+            #print(atom.element,atom.hybridization, h)
+            if h in (1,2):
+                open_nbr = False
+                for nbr_bond in atom.bonds:
+                    nbr = nbr_bond.other(atom)
+                    h2 = nbr.hybridization or 3
+                    if h2 < 3 or nbr.explicit_degree() == 1:
+                        #print('fuck')
+                        open_nbr = True
+                        break
+                if not open_nbr:
+                    #print('fuck again')
+                    atom.set_hybridization(h+1)
+                #print(atom.element, atom.hybridization)
+
+        # Pass 4: Functional group bonds
+        self.assign_functional_group_bonds(mol, tcmol)
+
+        # Pass 5: Aromatic ring typing & Kekulize (stub)
+        needs_sanitiza = False
+        for path in rings:
+            size = len(path)
+            if size in (5,6,7):
+                # check if any atom in path has multiple bond or non‐sp2
+                typed = any(
+                    (tcmol.atoms[idx].has_non_single_bond()
+                     or (tcmol.atoms[idx].hybridization != 2))
+                    for idx in path
+                )
+                if not typed:
+                    # mark all bonds aromatic
+                    edges = []
+                    for i in path:
+                        for j in path:
+                            if i == j:
+                                continue
+                            if (i, j) in edges or (j, i) in edges:
+                                continue
+                            if tcmol.HasBond(tcmol.get_atom_with_idx(i), tcmol.get_atom_with_idx(j)):
+                                edges.append((i, j))
+                    for i,j in edges:
+                        b = mol.GetBondBetweenAtoms(i, j)
+                        b_tc = tcmol.get_bond(i, j)
+                        if b:
+                            b.SetBondType(o2t[1.5])
+                            b_tc.set_order(1.5)
+                            needs_sanitiza = True
+        #return
+        if needs_sanitiza:
+            self._sanitize(mol, tcmol)
+        #raise
+        # Pass 6: Electronegativity‐driven multiple bond promotion
+        # Sort atoms by (EN*1e6 + shortestBond)
+        #en_map = {1:2.20,6:2.55,7:3.04,8:3.44,16:2.58}
+
+        def atom_score(atom: Atom) -> float:
+            sb = min((b.length() for b in atom.bonds
+                      if b.other(atom).atomic_num != 1), default=1e5)
+            en = atom.en #en_map.get(atom.atomic_num, 2.5)
+            return en*1e6 + sb
+
+        for atom in sorted(tcmol.atoms, key=atom_score):
+            deg = atom.explicit_degree()
+            hyb = atom.hybridization or 3
+            # candidate triple bond (sp or terminal)
+            if (hyb == 1 or deg == 1) and deg+2 <= atom.max_bonds():
+                if atom.has_non_single_bond(): continue
+                best: Optional[Bond] = None
+                best_en = 0.0
+                best_len = 1e5
+                for b in atom.bonds:
+                    nbr = b.other(atom)
+                    hy2 = nbr.hybridization or 3
+                    if ((hy2 == 1 or nbr.explicit_degree() == 1)
+                        and nbr.explicit_degree()+2 <= nbr.max_bonds()
+                        and not nbr.has_non_single_bond()):
+                        # test bond length
+                        L = b.length()
+                        if ((atom.explicit_degree()==1 or nbr.explicit_degree()==1)
+                            and L > 0.9*(atom.covalent_radius()+nbr.covalent_radius())):
+                            continue
+                        en2 = nbr.en #en_map.get(nbr.atomic_num, 2.5)
+                        if en2 > best_en or (math.isclose(en2, best_en) and L<best_len):
+                            best_en, best_len, best = en2, L, b
+                if best:
+                    best.set_order(3)
+                    rdbond = mol.GetBondBetweenAtoms(atom.idx, best.other(atom).idx)
+                    rdbond.SetBondType(o2t[3])
+            # candidate double bond (sp2 or terminal)
+            elif (hyb == 2 or deg == 1) and deg+1 <= atom.max_bonds():
+                if atom.has_non_single_bond(): continue
+                best: Optional[Bond] = None
+                best_en = 0.0
+                best_len = 1e5
+                for b in atom.bonds:
+                    nbr = b.other(atom)
+                    hy2 = nbr.hybridization or 3
+                    if ((hy2 == 2 or nbr.explicit_degree() == 1)
+                        and nbr.explicit_degree()+1 <= nbr.max_bonds()
+                        and tcmol._is_double_geometry(atom, nbr)):
+                        # ring‐sulfur special case
+                        if (atom.is_in_ring() and atom.atomic_num==16):
+                            continue
+                        L = b.length()
+                        if ((atom.explicit_degree()==1 or nbr.explicit_degree()==1)
+                            and L > 0.93*(atom.covalent_radius()+nbr.covalent_radius())):
+                            continue
+                        en2 = nbr.en #en_map.get(nbr.atomic_num, 2.5)
+                        better = False
+                        if en2 > best_en:
+                            better = True
+                        elif math.isclose(en2, best_en) and (
+                            (best and (not atom.is_in_ring() or not best.other(atom).is_in_ring() or nbr.is_in_ring()))
+                        ):
+                            better = True
+                        if better:
+                            best_en, best_len, best = en2, L, b
+                if best:
+                    best.set_order(2)
+                    rdbond = mol.GetBondBetweenAtoms(atom.idx, best.other(atom).idx)
+                    rdbond.SetBondType(o2t[2])
+        # Final sanitize
+        self._sanitize(mol, tcmol)
+
 
 
 
 if __name__ == "__main__":
     bondtyper = BondTyper(bondtyp_db='bondtyp.txt')
+    mol = Chem.MolFromSmiles('CC(C)(c1ccc(Oc2ccc3c(c2)C(=O)OC3=O)cc1)c1ccc(Oc2ccc3c(c2)C(=O)OC3=O)cc1')
+    mol = Chem.AddHs(mol)
+    AllChem.EmbedMolecule(mol)
+    AllChem.MMFFOptimizeMolecule(mol)
+    graphs = nx.Graph()
+    for atom in mol.GetAtoms():
+        idx = atom.GetIdx()
+        graphs.add_node(idx, element=atom.GetSymbol(), position=mol.GetConformer().GetAtomPosition(idx))
+    tCMol = TCMol(graphs)
+    tCMol.connect_the_dots()
+    new_mol = tCMol.TCMolToMol()
+    Chem.Kekulize(new_mol)
+    print(Chem.MolToSmiles(new_mol))
+    bondtyper.perceive_bond_order(new_mol, tCMol)
+    Chem.SanitizeMol(new_mol)
+    print(Chem.MolToSmiles(new_mol))
+
 
